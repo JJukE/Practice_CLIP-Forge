@@ -25,10 +25,10 @@ conda env create -f environment.yaml
 conda activate clip_forge
 ```
 
-Then, [install PyTorch 1.7.1](https://pytorch.org/get-started/locally/) (or later) and torchvision. Please change the CUDA version based on your requirements. 
+Then, [install PyTorch 1.13.1](https://pytorch.org/get-started/locally/) (or later) and torchvision. Please change the CUDA version based on your requirements. 
 
 ```bash
-conda install --yes -c pytorch pytorch=1.7.1 torchvision cudatoolkit=11.0
+conda install pytorch=1.13.1 torchvision=0.14.1 pytorch-cuda=11.7 -c pytorch -c nvidia
 pip install git+https://github.com/openai/CLIP.git
 pip install sklearn
 ```
