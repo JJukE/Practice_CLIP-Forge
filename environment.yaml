@@ -1,4 +1,4 @@
-name: clip-forge_110
+name: clip-forge
 channels:
   - conda-forge
   - defaults

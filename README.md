@@ -22,15 +22,16 @@ If you find our code or paper useful, you can cite at:
 First create an anaconda environment called `clip_forge` using
 ```
 conda env create -f environment.yaml
-conda activate clip_forge
+conda activate clip-forge
 ```
 
-Then, [install PyTorch 1.13.1](https://pytorch.org/get-started/locally/) (or later) and torchvision. Please change the CUDA version based on your requirements. 
+Then, [install PyTorch 1.7.1](https://pytorch.org/get-started/locally/) (or later) and torchvision. Please change the CUDA version based on your requirements. 
 
 ```bash
-conda install pytorch=1.13.1 torchvision=0.14.1 pytorch-cuda=11.7 -c pytorch -c nvidia
+conda install --yes pytorch=1.7.1 torchvision=0.8.2 cudatoolkit=11.0 -c pytorch
+conda install -c conda-forge scikit-learn seaborn
+pip install -U numpy
 pip install git+https://github.com/openai/CLIP.git
-pip install sklearn
 ```
 
 Choose a folder to download the data, classifier and model: 
