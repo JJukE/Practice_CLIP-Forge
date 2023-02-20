@@ -3,3 +3,9 @@ exps/*
 nohup.out
 *pyc
 __pycache__ 
+
+# ipython notebook files
+*.ipynb
+
+# shell files
+*.sh
