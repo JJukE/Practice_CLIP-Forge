@@ -4,6 +4,8 @@ import logging
 import argparse
 from tqdm import tqdm
 
+import wandb
+
 from sklearn.metrics import accuracy_score, confusion_matrix
 import numpy as np
 
@@ -13,10 +15,18 @@ import matplotlib.image as mpimg
 from mpl_toolkits.mplot3d import Axes3D
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.optim import lr_scheduler
 import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+
+os.environ["OMP_NUM_THREADS"] = str(min(16, mp.cpu_count()))
+
+# for DDP
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 
 from utils import helper
@@ -32,7 +42,7 @@ def experiment_name(args):
 
     from datetime import datetime
 
-    tokens = ["Autoencoder", args.dataset_name, args.input_type, args.output_type, args.emb_dims, args.last_feature_transform]
+    tokens = ["Autoencoder", args.dataset_name, args.input_type, args.output_type, args.emb_dims, args.last_feature_transform, args.tag]
            
     if args.categories != None:
         for i in args.categories:
@@ -88,7 +98,7 @@ def compute_iou(occ1, occ2):
 
 ############################################# data loader #################################################
 
-def get_dataloader(args, split="train"):
+def get_dataloader(args, num_gpus, split="train"):
     
     if args.dataset_name == "Shapenet":
         pointcloud_field = shapenet_dataset.PointCloudField("pointcloud.npz")
@@ -103,14 +113,23 @@ def get_dataloader(args, split="train"):
 
         if split == "train":
             dataset = shapenet_dataset.Shapes3dDataset(args.dataset_path, fields, split=split,
-                     categories=args.categories, no_except=True, transform=None, num_points=args.num_points,           num_sdf_points=args.num_sdf_points, sampling_type=args.sampling_type)
+                     categories=args.categories, no_except=True, transform=None, num_points=args.num_points, num_sdf_points=args.num_sdf_points, sampling_type=args.sampling_type)
 
-            dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
+            # Sampler for DDP
+            sampler = DistributedSampler(dataset=dataset, shuffle=True)
+            
+            dataloader = DataLoader(dataset=dataset, batch_size=args.batch_size,
+                                    shuffle=False, sampler=sampler, num_workers=args.num_workers, drop_last=True, pin_memory=True)
             total_shapes = len(dataset)
         else:
             dataset = shapenet_dataset.Shapes3dDataset(args.dataset_path, fields, split=split,
                      categories=args.categories, no_except=True, transform=None, num_points=args.num_points, num_sdf_points=args.test_num_sdf_points,  sampling_type=args.sampling_type)
-            dataloader = DataLoader(dataset, batch_size=args.test_batch_size, shuffle=True, num_workers=args.num_workers, drop_last=False)
+            
+            # Sampler for DDP
+            sampler = DistributedSampler(dataset=dataset, shuffle=True)
+            
+            dataloader = DataLoader(dataset=dataset, batch_size=args.test_batch_size,
+                                    shuffle=False, sampler=sampler, num_workers=args.num_workers, drop_last=False, pin_memory=True)
             total_shapes = len(dataset)
         return dataloader, total_shapes 
   
@@ -165,7 +184,7 @@ def visualization_model(model, args, test_dataloader, name_info):
        
 ############################## validation #################################################
 
-def val_one_epoch_iou(model, args, test_dataloader, epoch):
+def val_one_epoch_iou(model, args, test_dataloader, epoch, local_rank):
     model.eval()
     loss_reconstruction = []
     points_voxels = visualization.make_3d_grid(
@@ -193,9 +212,12 @@ def val_one_epoch_iou(model, args, test_dataloader, epoch):
     loss_reconstruction = np.asarray(loss_reconstruction)
     loss_reconstruction = np.mean(loss_reconstruction)
     logging.info("[Val]  Epoch {} IOU Loss: {}".format(epoch, loss_reconstruction))
-    return loss_reconstruction  
+    
+    if local_rank == 0:
+        wandb.log({'Epoch': epoch, 'Reconstruction_loss(val)': loss_reconstruction})
+    return loss_reconstruction 
 
-def val_one_epoch(model, args, test_dataloader, epoch):
+def val_one_epoch(model, args, test_dataloader, epoch, local_rank):
     model.eval()
     loss_reconstruction = []
 
@@ -217,20 +239,23 @@ def val_one_epoch(model, args, test_dataloader, epoch):
                 gt = data['pc_org'].type(torch.FloatTensor).to(args.device) 
             
             pred, _ = model(data_input, query_points)
-            loss_reconstuct = model.reconstruction_loss(pred, gt)
+            loss_reconstuct = model.module.reconstruction_loss(pred, gt)
 
             loss_reconstruction.append(loss_reconstuct.item())
         
     loss_reconstruction = np.asarray(loss_reconstruction)
     loss_reconstruction = np.mean(loss_reconstruction)
     logging.info("[Val]  Epoch {} Loss: {}".format(epoch, loss_reconstruction))
-    return loss_reconstruction  
+    
+    if local_rank == 0:
+        wandb.log({'Epoch(val)': epoch, 'Reconstruction_loss(val)': loss_reconstruction})
+    return loss_reconstruction
 
 ############################## validation #################################################
 
 ############################## training #################################################
 
-def train_one_epoch(model, args, train_dataloader, optimizer, scheduler, loss_meter, epoch):
+def train_one_epoch(model, args, train_dataloader, optimizer, scheduler, loss_meter, epoch, local_rank):
     model.train()
     loss_reconstruction = []    
     iteration = 0
@@ -256,7 +281,7 @@ def train_one_epoch(model, args, train_dataloader, optimizer, scheduler, loss_me
         
         pred, shape_embs = model(data_input, query_points)
 
-        loss_reconstuct = model.reconstruction_loss(pred, gt)
+        loss_reconstuct = model.module.reconstruction_loss(pred, gt)
                    
         loss = loss_reconstuct 
         loss.backward()
@@ -267,8 +292,10 @@ def train_one_epoch(model, args, train_dataloader, optimizer, scheduler, loss_me
            
         if iteration % args.print_every == 0:
             avg_reconstruction_loss = np.mean(np.asarray(loss_reconstruction))
-          
             logging.info("[Train]  Epoch {}, Iteration {} loss: {}, recon loss: {}".format(epoch, iteration, loss_meter.avg, avg_reconstruction_loss))
+        
+            if local_rank == 0:
+                wandb.log({'Loss(train)': loss_meter.avg, 'Reconstruction_loss(train)': avg_reconstruction_loss})
 
 ############################## training #################################################   
 
@@ -284,6 +311,7 @@ def parsing(mode="args"):
     parser.add_argument('--last_feature_transform', type=str, default="add_noise", help='add_noise or none')
     parser.add_argument('--reconstruct_loss_type', type=str, default="sum", help='bce or sum (mse) or mean (mse)')
     parser.add_argument('--pc_dims', type=int, default=1024, help='Dimension of embedding')
+    parser.add_argument('--tag', type=str, required=True, help='tag for save directory name')
                         
     ### Dataset details
     parser.add_argument('--dataset_path', type=str, default=None, help='Dataset path')
@@ -296,18 +324,18 @@ def parsing(mode="args"):
     
     ### training details
     parser.add_argument('--train_mode', type=str, default="train", help='train or test')
-    parser.add_argument('--seed', type=int, default=1, help='Seed')
+    parser.add_argument('--seed', type=int, default=2023, help='Seed')
     parser.add_argument('--epochs', type=int, default=300, help="Total epochs")
     parser.add_argument('--checkpoint', type=str, default=None, help="Checkpoint to load")
     parser.add_argument('--use_timestamp',  action='store_true', help='Whether to use timestamp in dump files')
     parser.add_argument('--num_iterations', type=int, default=300000, help='How long the training shoulf go on')    
-    parser.add_argument('--gpu', nargs='+' , default="0", help='GPU list')
     parser.add_argument('--optimizer', type=str, choices=('SGD', 'Adam'), default='Adam')
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--batch_size', type=int, default=32, help='Dimension of embedding')
     parser.add_argument('--test_batch_size', type=int, default=32, help='Dimension of embedding')
     parser.add_argument('--threshold', type=float, default=0.05, help='Threshold for voxel stuff')
     parser.add_argument('--sampling_type', type=str, default=None, help='what sampling type: None--> Uniform')
+    parser.add_argument('--local_rank', type=int, default=0, help='local rank for DDP')
     
     ### Logging details 
     parser.add_argument('--print_every', type=int, default=50, help='Printing the loss every')
@@ -327,17 +355,36 @@ def parsing(mode="args"):
 
 def main():
     args = parsing()
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device: ", device)
+    
+    args.device = device
+    
+    # DDP initialization
+    dist.init_process_group(backend='nccl')
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    num_gpus = torch.distributed.get_world_size() # total number of gpus to be used
+    
     exp_name = experiment_name(args)
     
     manualSeed = args.seed
     helper.set_seed(manualSeed)
+
+    if local_rank == 0:
+        run = wandb.init(
+            entity="ray_park",
+            project="CLIP-Forge",
+            name=args.tag
+        )
 
     # Create directories for checkpoints and logging
     args.experiment_dir = osp.join('exps', exp_name)
     args.checkpoint_dir = osp.join('exps', exp_name, 'checkpoints')
     args.vis_dir =  osp.join('exps', exp_name, 'vis_dir') + "/"
     args.generate_dir =  osp.join('exps', exp_name, 'generate_dir') + "/"                          
-    
     
     if args.train_mode != "test":
         log_filename = osp.join('exps', exp_name, 'log.txt')
@@ -354,24 +401,20 @@ def main():
         args.vis_gen_dir =  osp.join('exps', exp_name, 'vis_gen_dir') + "/"                          
         helper.create_dir(args.vis_gen_dir)
         
-        
-        
     logging.info("Experiment name: {}".format(exp_name))
     logging.info("{}".format(args))
-
-    device, gpu_array = helper.get_device(args)
-    args.device = device 
     
     logging.info("#############################")
-    train_dataloader, total_shapes  = get_dataloader(args, split="train")
+    train_dataloader, total_shapes  = get_dataloader(args, num_gpus, split="train")
     args.total_shapes = total_shapes
     logging.info("Train Dataset size: {}".format(total_shapes))
-    test_dataloader, total_shapes_test  = get_dataloader(args, split="val")
+    test_dataloader, total_shapes_test  = get_dataloader(args, num_gpus, split="val")
     logging.info("Test Dataset size: {}".format(total_shapes_test))
     logging.info("#############################")
     
-    #####
+    # model wrapping for DDP
     net = autoencoder.get_model(args).to(args.device)
+    net = DDP(module=net, device_ids=[local_rank])
     print(net)
     logging.info("#############################")
     
@@ -385,10 +428,10 @@ def main():
         logging.info("Test Dataset size: {}".format(total_shapes_test))
         
         if args.output_type == "Implicit":
-            test_iou = val_one_epoch_iou(net, args, full_test_dataloader, 0)
+            test_iou = val_one_epoch_iou(net, args, full_test_dataloader, 0, local_rank=local_rank)
             logging.info("Test iou {}".format(test_iou))
         elif  args.output_type == "Pointcloud":
-            test_val = val_one_epoch(net, args, full_test_dataloader, 0)
+            test_val = val_one_epoch(net, args, full_test_dataloader, 0, local_rank=local_rank)
             logging.info("Test val loss {}".format(test_val))
         
     else:
@@ -404,7 +447,6 @@ def main():
             optimizer.load_state_dict(checkpoint['optimizer'])
             scheduler.load_state_dict(checkpoint['scheduler'])
             start_epoch = checkpoint['current_epoch']
-            
 
         best_loss = 100000    
         best_iou = 0
@@ -414,29 +456,35 @@ def main():
             loss_meter = helper.AverageMeter()
             logging.info("#############################")
             #val_iou = val_one_epoch_iou(net, args, test_dataloader, epoch)
-            train_one_epoch(net, args, train_dataloader, optimizer, scheduler, loss_meter, epoch)
+            train_one_epoch(net, args, train_dataloader, optimizer, scheduler, loss_meter, epoch, local_rank=local_rank)
     
-            if (epoch + 1) % 5 == True:
-                visualization_model(net, args, test_dataloader, epoch)
+            # if (epoch + 1) % 5 == True:
+            #     visualization_model(net, args, test_dataloader, epoch)
             
             if args.output_type == "Implicit":
-                val_iou = val_one_epoch_iou(net, args, test_dataloader, epoch)
+                val_iou = val_one_epoch_iou(net, args, test_dataloader, epoch, local_rank=local_rank)
                 if  best_iou < val_iou:
                     best_iou = val_iou
                     filename = '{}.pt'.format("best_iou")
-                    logging.info("Saving Model........{}".format(filename))
-                    helper.save_checkpoint(osp.join(args.checkpoint_dir, filename), net, args, optimizer, scheduler, epoch)
+                    
+                    if local_rank == 0:
+                        logging.info("Saving Model........{}".format(filename))
+                        helper.save_checkpoint(osp.join(args.checkpoint_dir, filename), net, args, optimizer, scheduler, epoch)
             elif args.output_type == "Pointcloud":
-                val_loss = val_one_epoch(net, args, test_dataloader, epoch)
+                val_loss = val_one_epoch(net, args, test_dataloader, epoch, local_rank=local_rank)
                 if  best_loss > val_loss:
                     best_loss = val_loss
                     filename = '{}.pt'.format("best")
-                    logging.info("Saving Model........{}".format(filename))
-                    helper.save_checkpoint(osp.join(args.checkpoint_dir, filename), net, args, optimizer, scheduler, epoch)
+                    
+                    if local_rank == 0:
+                        logging.info("Saving Model........{}".format(filename))
+                        helper.save_checkpoint(osp.join(args.checkpoint_dir, filename), net, args, optimizer, scheduler, epoch)
 
             filename = '{}.pt'.format("last")
-            logging.info("Saving Model........{}".format(filename))
-            helper.save_checkpoint(osp.join(args.checkpoint_dir, filename), net, args, optimizer, scheduler, epoch)
+            
+            if local_rank == 0:
+                logging.info("Saving Model........{}".format(filename))
+                helper.save_checkpoint(osp.join(args.checkpoint_dir, filename), net, args, optimizer, scheduler, epoch)
 
 
 if __name__ == "__main__":

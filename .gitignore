@@ -9,3 +9,5 @@ __pycache__
 
 # shell files
 *.sh
+
+wandb/

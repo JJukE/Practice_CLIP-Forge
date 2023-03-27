@@ -3,6 +3,7 @@ import os.path as osp
 import logging
 
 from tqdm import tqdm
+from collections import OrderedDict
 from sklearn.metrics import accuracy_score, confusion_matrix
 import numpy as np
 
@@ -227,6 +228,7 @@ def get_true_voxels(test_dataloader, args):
     return voxel_array
 
 def voxel_save(voxels, text_name, out_file=None, transpose=True, show=False):
+    print("voxel_save executed 1")
 
     # Use numpy
     voxels = np.asarray(voxels)
@@ -240,7 +242,6 @@ def voxel_save(voxels, text_name, out_file=None, transpose=True, show=False):
     #else:
         #voxels = voxels.transpose(2, 0, 1)
     
-
     ax.voxels(voxels, edgecolor='k', facecolors='coral', linewidth=0.5)
     ax.set_xlabel('Z')
     ax.set_ylabel('X')
@@ -254,15 +255,15 @@ def voxel_save(voxels, text_name, out_file=None, transpose=True, show=False):
     #plt.text(15, -0.01, "Correlation Graph between Citation & Favorite Count")
 
     ax.view_init(elev=30, azim=45)
-
-    if out_file is not None:
-        plt.axis('off')
-        plt.savefig(out_file)
-    if show:
-        plt.show()
+    # if out_file is not None:
+    plt.axis('off')
+    plt.savefig(out_file)
+    # if show:
+    #     plt.show()
     plt.close(fig)
 
 def save_voxel_images(net, latent_flow_model, clip_model, args, total_text_query, save_path, resolution=64, num_figs_per_query=5):
+    print("save_voxel_images executed")
     net.eval()
     latent_flow_model.eval()
     clip_model.eval()
@@ -322,7 +323,14 @@ def get_local_parser_test(mode="args"):
 def main():
     args = get_local_parser_test() 
     
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device: ", device)
+    
+    args.device = device
+    
     ### Directories for generating stuff and logs    cls_cal_category
+    args.output_dir = args.output_dir + "_" + args.tag
     test_log_filename = osp.join(args.output_dir, 'test_log.txt')
     helper.create_dir(args.output_dir)
     helper.setup_logging(test_log_filename, args.log_level, 'w')
@@ -344,17 +352,20 @@ def main():
         logging.info("Val Dataset size: {}".format(total_shapes_val))
         test_dataloader, total_shapes_test, test_dataset  = get_dataloader(args, split="test", dataset_flag=True)
         logging.info("Test Dataset size: {}".format(total_shapes_test))
-        logging.info("#############################")
-
-    device, gpu_array = helper.get_device(args)
-    args.device = device     
+        logging.info("#############################")  
 
     ### Network stuff 
     logging.info("#############################")
 
     net = autoencoder.get_model(args).to(args.device)
     checkpoint = torch.load(args.checkpoint_dir_base +"/"+ args.checkpoint +".pt", map_location=args.device)
-    net.load_state_dict(checkpoint['model'])
+    state_dict = checkpoint['model']
+    net_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k[7:] # remove 'module.' of DDP
+        net_state_dict[name] = v    
+    
+    net.load_state_dict(net_state_dict)
     net.eval()
     logging.info("Loaded the autoencoder: {}".format(args.checkpoint_dir_base +"/"+ args.checkpoint +".pt"))
     
@@ -366,7 +377,13 @@ def main():
     logging.info("Loaded the nf model: {}".format(checkpoint_nf_path))
     
     checkpoint = torch.load(checkpoint_nf_path, map_location=args.device)
-    latent_flow_network.load_state_dict(checkpoint['model'])
+    state_dict = checkpoint['model']
+    lfn_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k[7:] # remove 'module.' of DDP
+        lfn_state_dict[name] = v
+    
+    latent_flow_network.load_state_dict(lfn_state_dict)
     latent_flow_network.eval()
 
 

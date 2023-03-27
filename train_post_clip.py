@@ -26,11 +26,24 @@ from train_autoencoder import experiment_name, parsing
 from networks import autoencoder, latent_flows
 import clip
 
+# for DDP
+import torch.multiprocessing as mp
+
+os.environ["OMP_NUM_THREADS"] = str(min(16, mp.cpu_count()))
+
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+from collections import OrderedDict
+
+# wandb
+import wandb
+
 ###################################### Experiment Utils########################################################
 
 def experiment_name2(args):
     tokens = ["Clip_Conditioned", args.flow_type, args.num_blocks,  args.checkpoint, args.num_views, args.clip_model_type, args.num_hidden, args.seed_nf]
-        
+    
     if args.noise != "add":
         tokens.append("no_noise")
     
@@ -68,7 +81,7 @@ def get_clip_model(args):
 
 ############################################# data loader #################################################
 
-def get_dataloader(args, split="train", dataset_flag=False):
+def get_dataloader(args, local_rank, split="train", dataset_flag=False):
     
     dataset_name = args.dataset_name
                 
@@ -98,12 +111,19 @@ def get_dataloader(args, split="train", dataset_flag=False):
             dataset = shapenet_dataset.Shapes3dDataset(args.dataset_path, fields, split=split,
                      categories=args.categories, no_except=True, transform=None, num_points=args.num_points)
 
-            dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True, collate_fn=my_collate)
+            # Sampler for DDP
+            train_sampler = DistributedSampler(dataset=dataset, shuffle=True)
+            
+            dataloader = DataLoader(dataset=dataset, batch_size=args.batch_size, num_workers=4, sampler=train_sampler, drop_last=True, collate_fn=my_collate)
             total_shapes = len(dataset)
         else:
             dataset = shapenet_dataset.Shapes3dDataset(args.dataset_path, fields, split=split,
                      categories=args.categories, no_except=True, transform=None, num_points=args.num_points)
-            dataloader = DataLoader(dataset, batch_size=args.test_batch_size, shuffle=True, num_workers=args.num_workers, drop_last=False, collate_fn=my_collate)
+            
+            # Sampler for DDP
+            val_sampler = DistributedSampler(dataset=dataset, shuffle=False)
+            
+            dataloader = DataLoader(dataset=dataset, batch_size=args.test_batch_size, num_workers=4, sampler=val_sampler, drop_last=False, collate_fn=my_collate)
             total_shapes = len(dataset)
 
         if dataset_flag == True:  
@@ -140,9 +160,9 @@ def get_condition_embeddings(args, model, clip_model, dataloader, times=5):
                 elif args.input_type == "Pointcloud":
                     data_input = data['pc_org'].type(torch.FloatTensor).to(args.device).transpose(-1, 1)
             
-                shape_emb = model.encoder(data_input)
+                shape_emb = model.module.encoder(data_input)
                 
-                image_features = clip_model.encode_image(image)
+                image_features = clip_model.module.encode_image(image)
                 image_features = image_features / image_features.norm(dim=-1, keepdim=True)
                     
                 shape_embeddings.append(shape_emb.detach().cpu().numpy())
@@ -173,13 +193,13 @@ def generate_on_query_text(args, clip_model, autoencoder, latent_flow_model):
        
         for text_in in args.text_query:
             text = clip.tokenize([text_in]).to(args.device)
-            text_features = clip_model.encode_text(text)
+            text_features = clip_model.module.encode_text(text)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             
             noise = torch.Tensor(num_figs, args.emb_dims).normal_().to(args.device)
-            decoder_embs = latent_flow_model.sample(num_figs, noise=noise, cond_inputs=text_features.repeat(num_figs,1))
+            decoder_embs = latent_flow_model.module.sample(num_figs, noise=noise, cond_inputs=text_features.repeat(num_figs,1))
 
-            out = autoencoder.decoding(decoder_embs, query_points)
+            out = autoencoder.module.decoding(decoder_embs, query_points)
             
             if args.output_type == "Implicit":
                 voxels_out = (out.view(num_figs, voxel_size, voxel_size, voxel_size) > args.threshold).detach().cpu().numpy()
@@ -209,7 +229,7 @@ def train_one_epoch(args, latent_flow_model, train_dataloader, optimizer, epoch)
         if args.noise == "add":
             train_embs = train_embs + 0.1 * torch.randn(train_embs.size(0), args.emb_dims).to(args.device)
         
-        loss_log_prob = - latent_flow_model.log_prob(train_embs, train_cond_embs).mean()  
+        loss_log_prob = - latent_flow_model.module.log_prob(train_embs, train_cond_embs).mean()  
         loss = loss_log_prob
         loss.backward()
         optimizer.step()
@@ -217,7 +237,8 @@ def train_one_epoch(args, latent_flow_model, train_dataloader, optimizer, epoch)
         loss_prob_array.append(loss_log_prob.item())
     loss_array = np.asarray(loss_array)
     loss_prob_array = np.asarray(loss_prob_array)
-    logging.info("[Train] Epoch {} Train loss {} Prob loss {} ".format(epoch, np.mean(loss_array), np.mean(loss_prob_array))) 
+    logging.info("[Train] Epoch {} Train loss {} Prob loss {} ".format(epoch, np.mean(loss_array), np.mean(loss_prob_array)))
+    wandb.log({'Epoch': epoch, 'Loss(train)': np.mean(loss_array), 'Prob Loss(train)': np.mean(loss_prob_array)})
     
 def val_one_epoch(args, latent_flow_model, val_dataloader, epoch):
     loss_prob_array = []
@@ -228,17 +249,18 @@ def val_one_epoch(args, latent_flow_model, val_dataloader, epoch):
             train_embs, train_cond_embs = data
             train_embs = train_embs.type(torch.FloatTensor).to(args.device)
             train_cond_embs = train_cond_embs.type(torch.FloatTensor).to(args.device)
-            loss_log_prob = - latent_flow_model.log_prob(train_embs, train_cond_embs).mean()  
+            loss_log_prob = - latent_flow_model.module.log_prob(train_embs, train_cond_embs).mean()  
             loss = loss_log_prob
             loss_array.append(loss.item())
             loss_prob_array.append(loss_log_prob.item())
     loss_array = np.asarray(loss_array)
     loss_prob_array = np.asarray(loss_prob_array)
     logging.info("[VAL] Epoch {} Train loss {} Prob loss {} ".format(epoch, np.mean(loss_array), np.mean(loss_prob_array)))
+    wandb.log({'Loss(val)': np.mean(loss_array), 'Prob Loss(val)': np.mean(loss_prob_array)})
     return  np.mean(loss_array)
 ###################################### train and validation ###########################################
 
-######################################## main and parser stuff ##########################################
+##################################### main and parser stuff ##########################################
 
 def get_local_parser(mode="args"):
     parser = parsing(mode="parser")
@@ -253,6 +275,7 @@ def get_local_parser(mode="args"):
     parser.add_argument("--seed_nf",  type=int, default=1, metavar='N', help='add or remove')
     parser.add_argument("--images_type",  type=str, default=None, help='img_choy13 or img_custom')
     parser.add_argument("--n_px",  type=int, default=224, help='Resolution of the image')
+    parser.add_argument("--ckpt_ae", type=str, required=True, default="", help='checkpoint of autoencoder model')
     
     
     if mode == "args":
@@ -265,8 +288,23 @@ def get_local_parser(mode="args"):
 
 def main():
     args = get_local_parser()
-    exp_name = experiment_name(args)
+    exp_name = args.ckpt_ae
     exp_name_2 = experiment_name2(args)
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device: ", device)
+    
+    args.device = device
+    
+    # DDP initialization
+    dist.init_process_group(backend='nccl')
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    num_gpus = torch.distributed.get_world_size()
+    
+    if local_rank == 0:
+	    run = wandb.init(entity="ray_park", project="CLIP-Forge", name=args.tag)
     
     manualSeed = args.seed_nf
     helper.set_seed(manualSeed)
@@ -297,25 +335,34 @@ def main():
         
     logging.info("Experiment name: {} and Experiment name 2 {}".format(exp_name, exp_name_2))
     logging.info("{}".format(args))
-
-    device, gpu_array = helper.get_device(args)
-    args.device = device 
     
     args, clip_model = get_clip_model(args)
     
+    # model wrapping for DDP
+    clip_model = DDP(module=clip_model, device_ids=[local_rank])
+    
     logging.info("#############################")
-    train_dataloader, total_shapes  = get_dataloader(args, split="train")
+    train_dataloader, total_shapes  = get_dataloader(args, split="train", local_rank=local_rank)
     args.total_shapes = total_shapes
     logging.info("Train Dataset size: {}".format(total_shapes))
-    val_dataloader, total_shapes_val  = get_dataloader(args, split="val")
+    val_dataloader, total_shapes_val  = get_dataloader(args, split="val", local_rank=local_rank)
     logging.info("Test Dataset size: {}".format(total_shapes_val))
     logging.info("#############################")
     
     
-    
+    # model wrapping for DDP
     net = autoencoder.get_model(args).to(args.device)
     checkpoint = torch.load(args.checkpoint_dir_base +"/"+ args.checkpoint +".pt", map_location=args.device)
-    net.load_state_dict(checkpoint['model'])
+    
+    # load state dict for DDP
+    state_dict = checkpoint['model']
+    net_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k[7:] # remove 'module.' of DDP
+        net_state_dict[name] = v
+    
+    net.load_state_dict(net_state_dict)
+    net = DDP(module=net, device_ids=[local_rank])
     net.eval()
     
     logging.info("#############################")
@@ -323,16 +370,24 @@ def main():
     train_shape_embeddings, train_cond_embeddings = get_condition_embeddings(args, net, clip_model, train_dataloader, times=args.num_views)
     logging.info("Train Embedding Shape {}, Train Condition Embedding {}".format(train_shape_embeddings.shape, train_cond_embeddings.shape))
     train_dataset_new = torch.utils.data.TensorDataset(torch.from_numpy(train_shape_embeddings), torch.from_numpy(train_cond_embeddings))
-    train_dataloader_new = DataLoader(train_dataset_new, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
+    
+    # Sampler for DDP
+    train_sampler = DistributedSampler(dataset=train_dataset_new, shuffle=True)
+    train_dataloader_new = DataLoader(train_dataset_new, batch_size=args.batch_size, num_workers=4, sampler=train_sampler, drop_last=True)
     
     logging.info("Getting val shape embeddings and condition embedding")
     val_shape_embeddings, val_cond_embeddings = get_condition_embeddings(args, net, clip_model, val_dataloader, times=1)
     logging.info("Val Embedding Shape {}, Val Condition Embedding {}".format(val_shape_embeddings.shape, val_cond_embeddings.shape))
     val_dataset_new = torch.utils.data.TensorDataset(torch.from_numpy(val_shape_embeddings), torch.from_numpy(val_cond_embeddings))
-    val_dataloader_new = DataLoader(val_dataset_new, batch_size=args.test_batch_size, shuffle=True, num_workers=args.num_workers, drop_last=False)
+
+    # Sampler for DDP
+    val_sampler = DistributedSampler(dataset=val_dataset_new, shuffle=True)
+    val_dataloader_new = DataLoader(val_dataset_new, batch_size=args.test_batch_size, num_workers=4, sampler=val_sampler, drop_last=False)
     logging.info("#############################")
     
+    # model wrapping for DDP
     latent_flow_network = latent_flows.get_generator(args.emb_dims, args.cond_emb_dim, device, flow_type=args.flow_type, num_blocks=args.num_blocks, num_hidden=args.num_hidden)
+    latent_flow_network = DDP(module=latent_flow_network, device_ids=[local_rank])
     
     if args.train_mode == "test":
         pass
@@ -344,7 +399,15 @@ def main():
         if args.latent_load_checkpoint is not None:
             checkpoint_dir = args.new_checkpoint_dir + "/{}.pt".format(args.latent_load_checkpoint)
             checkpoint = torch.load(checkpoint_dir, map_location=args.device)
-            latent_flow_network.load_state_dict(checkpoint['model'])
+            
+            # load state dict for DDP
+            state_dict = checkpoint['model']
+            lfn_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                name = k[7:] # remove 'module.' of DDP
+                lfn_state_dict[name] = v
+            latent_flow_network.load_state_dict(lfn_state_dict)
+
             start_epoch = checkpoint['current_epoch']
             
             
@@ -352,23 +415,26 @@ def main():
         for epoch in range(start_epoch, args.epochs):
             logging.info("#############################")
             
-            if (epoch + 1) % 5 == True:
-                if args.text_query is not None:
-                    generate_on_query_text(args, clip_model, net, latent_flow_network)
+            # if (epoch + 1) % 5 == True:
+            #     if args.text_query is not None:
+            #         generate_on_query_text(args, clip_model, net, latent_flow_network)
                 
             train_one_epoch(args, latent_flow_network, train_dataloader_new, optimizer, epoch)   
             val_loss = val_one_epoch(args, latent_flow_network, val_dataloader_new,  epoch)
             
-            filename = '{}.pt'.format(args.checkpoint_dir + "/last")
-            logging.info("Saving Model........{}".format(filename))
-            torch.save({'model': latent_flow_network.state_dict(), 'args': args, "current_epoch": epoch}, '{}'.format(filename))
-
-            if best_loss > val_loss:
-                best_loss = val_loss
-                filename = '{}.pt'.format(args.checkpoint_dir + "/best")
+            if local_rank == 0:
+                filename = '{}.pt'.format(args.checkpoint_dir + "/last")
                 logging.info("Saving Model........{}".format(filename))
-                torch.save({'model': latent_flow_network.state_dict(), 'args': args, "current_epoch": epoch}, '{}'.format(filename))    
-            
+                torch.save({'model': latent_flow_network.state_dict(), 'args': args, "current_epoch": epoch}, '{}'.format(filename))
+                
+                if best_loss > val_loss:
+                    best_loss = val_loss
+                    filename = '{}.pt'.format(args.checkpoint_dir + "/best")
+                    logging.info("Saving Model........{}".format(filename))
+                    torch.save({'model': latent_flow_network.state_dict(), 'args': args, "current_epoch": epoch}, '{}'.format(filename))
+        if local_rank == 0:
+            wandb.finish()
+
 if __name__ == "__main__":
     main()          
         
