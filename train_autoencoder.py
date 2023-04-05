@@ -458,8 +458,8 @@ def main():
             #val_iou = val_one_epoch_iou(net, args, test_dataloader, epoch)
             train_one_epoch(net, args, train_dataloader, optimizer, scheduler, loss_meter, epoch, local_rank=local_rank)
     
-            # if (epoch + 1) % 5 == True:
-            #     visualization_model(net, args, test_dataloader, epoch)
+            if (epoch + 1) % 5 == True:
+                visualization_model(net, args, test_dataloader, epoch)
             
             if args.output_type == "Implicit":
                 val_iou = val_one_epoch_iou(net, args, test_dataloader, epoch, local_rank=local_rank)
